@@ -3,20 +3,18 @@ import logging
 import os
 import json
 import sys
+from aiohttp import web
 from aiogram.filters import CommandObject
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, PollAnswer
+from aiogram.types import Message, PollAnswer, ChatMemberAdministrator, ChatMemberOwner
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 
-# --- НАСТРОЙКИ ---
 TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = 5273553942  # ТВОЙ_TELEGRAM_ID (число, без кавычек)
+OWNER_ID = 5273553942  # Твой ID (как главный создатель)
 
 if not TOKEN:
     print("❌ Ошибка: переменная окружения BOT_TOKEN не задана!")
-    print("Перед запуском выполни в PowerShell:")
-    print('  $env:BOT_TOKEN="твой_токен_от_BotFather"')
     sys.exit(1)
 
 bot = Bot(token=TOKEN)
@@ -29,114 +27,141 @@ quiz_state = {
     "active_poll_id": None,
     "active_chat_id": None,
     "active_message_id": None,
-    "first_blood_taken": False,  # Успел ли кто-то ответить первым
-    "scores": {}  # Структура: { user_id: {"name": "Имя", "score": 10} }
+    "first_blood_taken": False,
+    "scores": {}
 }
+
+
+# --- ХЕЛПЕРЫ ПРОВЕРКИ ПРАВ ---
+async def is_admin(message: Message) -> bool:
+    """Разрешает команды в ЛС хозяину/админу, либо админам текущей группы"""
+    if message.chat.type == "private":
+        return True
+    try:
+        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        return isinstance(member, (ChatMemberAdministrator, ChatMemberOwner)) or message.from_user.id == OWNER_ID
+    except Exception:
+        return False
 
 
 # --- ХЭНДЛЕРЫ ---
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
-    await message.answer("✅ Бот работает")
+    await message.answer("✅ Бот-викторина работает! Отправь мне .json файл с вопросами в ЛС для загрузки.")
 
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     text = (
-        "📖 **Список команд:**\n\n"
-        "/start — проверить, что бот работает\n"
-        "/help — показать это сообщение\n"
-        "/packs — показать доступные JSON-паки с вопросами (только админ)\n"
-        "/loadpack имя_файла.json — загрузить пак вопросов (только админ)\n"
-        "/start_quiz — начать викторину, сбросить баллы (только админ)\n"
-        "/next — отправить следующий вопрос (только админ)\n"
-        "/stats — показать таблицу лидеров (только админ)"
+        "📖 <b>Список команд:</b>\n\n"
+        "▫️ <b>Загрузка вопросов:</b> Отправь .json файл боту в ЛС!\n"
+        "▫️ <b>/packs</b> — показать доступные JSON-паки\n"
+        "▫️ <b>/loadpack имя_файла.json</b> — загрузить пак вопросов\n"
+        "▫️ <b>/start_quiz</b> — начать викторину, сбросить баллы\n"
+        "▫️ <b>/next</b> — отправить следующий вопрос\n"
+        "▫️ <b>/stats</b> — показать таблицу лидеров"
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="HTML")
+
+
+# Прием JSON файлов в ЛС от админов
+@dp.message(F.document)
+async def handle_json_upload(message: Message):
+    if not await is_admin(message):
+        return
+
+    document = message.document
+    if not document.file_name.endswith('.json'):
+        return
+
+    file_info = await bot.get_file(document.file_id)
+    destination_name = document.file_name
+
+    try:
+        downloaded_file = await bot.download_file(file_info.file_path)
+        content = downloaded_file.read().decode('utf-8')
+        data = json.loads(content)
+
+        if not isinstance(data, list) or len(data) == 0:
+            await message.reply("❌ Ошибка: Файл должен содержать список вопросов (массив `[...]`).")
+            return
+
+        # Проверка структуры каждого вопроса
+        for idx, item in enumerate(data, 1):
+            if not isinstance(item, dict) or "question" not in item or "options" not in item or "correct_index" not in item:
+                await message.reply(f"❌ Ошибка в вопросе №{idx}: нужны ключи `question`, `options` и `correct_index`.")
+                return
+
+        with open(destination_name, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        await message.reply(
+            f"📥 <b>Файл <code>{destination_name}</code> сохранён!</b>\n"
+            f"📊 Всего вопросов в паке: {len(data)}\n\n"
+            f"Загрузить в викторину:\n<code>/loadpack {destination_name}</code>",
+            parse_mode="HTML"
+        )
+
+    except json.JSONDecodeError:
+        await message.reply("❌ Ошибка: Битный JSON файл!")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка: {e}")
 
 
 @dp.message(Command("packs"))
 async def cmd_packs(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    # Ищем все файлы с расширением .json в текущей папке
+    if not await is_admin(message): return
     files = [f for f in os.listdir('.') if f.endswith('.json')]
-
     if not files:
-        await message.answer("📭 Паков с вопросами (JSON файлов) в папке не найдено.")
+        await message.answer("📭 JSON-паков в папке не найдено.")
         return
-
-    text = "📚 **Доступные паки викторин:**\n\n"
-    for f in files:
-        text += f"▫️ `{f}`\n"
-
-    text += "\nЧтобы загрузить, отправь команду:\n`/loadpack имя_файла.json`"
-    await message.answer(text, parse_mode="Markdown")
+    text = "📚 <b>Доступные паки викторин:</b>\n\n"
+    for f in files: text += f"▫️ <code>{f}</code>\n"
+    text += "\nЧтобы загрузить:\n<code>/loadpack имя_файла.json</code>"
+    await message.answer(text, parse_mode="HTML")
 
 
 @dp.message(Command("loadpack"))
 async def cmd_loadpack(message: Message, command: CommandObject):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    # Проверяем, передал ли админ имя файла
+    if not await is_admin(message): return
     if not command.args:
-        await message.answer("⚠️ Укажи имя файла! Пример: `/loadpack quiz.json`", parse_mode="Markdown")
+        await message.answer("⚠️ Укажи имя файла! Пример: <code>/loadpack quiz.json</code>", parse_mode="HTML")
         return
 
     filename = command.args.strip()
-
-    # Проверяем, существует ли такой файл
     if not os.path.exists(filename):
-        await message.answer(f"❌ Файл `{filename}` не найден!", parse_mode="Markdown")
+        await message.answer(f"❌ Файл <code>{filename}</code> не найден!", parse_mode="HTML")
         return
 
-    # Читаем файл и загружаем в quiz_state
     try:
         with open(filename, 'r', encoding='utf-8') as file:
             data = json.load(file)
-
-            # Проверяем, что в файле действительно список (массив)
             if not isinstance(data, list):
-                await message.answer("❌ Ошибка формата: JSON должен содержать список вопросов (массив).")
+                await message.answer("❌ Ошибка: JSON должен содержать список вопросов.")
                 return
-
             quiz_state["questions"] = data
-            await message.answer(f"✅ Пак `{filename}` успешно загружен! Вопросов в паке: {len(data)}\n"
-                                 f"Теперь можешь писать `/start_quiz`.")
-    except json.JSONDecodeError:
-        await message.answer("❌ Ошибка чтения файла! Проверь синтаксис JSON (запятые, кавычки).")
+            await message.answer(f"✅ Пак <code>{filename}</code> загружен! Вопросов: {len(data)}\nПиши /start_quiz для старта.", parse_mode="HTML")
     except Exception as e:
-        await message.answer(f"❌ Произошла непредвиденная ошибка: {e}")
+        await message.answer(f"❌ Ошибка чтения: {e}")
 
 
 @dp.message(Command("start_quiz"))
 async def cmd_start_quiz(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    # Проверка на то, загружены ли вопросы
+    if not await is_admin(message): return
     if not quiz_state["questions"]:
-        await message.answer(
-            "⚠️ Ошибка: Вопросы не загружены!\nСначала загрузи пак через команду `/loadpack имя_файла.json`",
-            parse_mode="Markdown")
+        await message.answer("⚠️ Вопросы не загружены! Загрузи пак через /loadpack")
         return
 
     quiz_state["current_index"] = 0
     quiz_state["scores"] = {}
     quiz_state["active_poll_id"] = None
-
-    await message.answer("🎮 Викторина инициализирована! Баллы сброшены.\n"
-                         "Введи /next, чтобы запустить первый вопрос.")
+    await message.answer("🎮 Викторина инициализирована! Баллы сброшены.\nВведи /next, чтобы запустить первый вопрос.")
 
 
 @dp.message(Command("next"))
 async def cmd_next(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if not await is_admin(message): return
 
-    # 1. Закрываем предыдущий опрос, если он был отправлен
     if quiz_state["active_poll_id"]:
         try:
             await bot.stop_poll(
@@ -144,16 +169,13 @@ async def cmd_next(message: Message):
                 message_id=quiz_state["active_message_id"]
             )
         except TelegramBadRequest:
-            # Опрос уже мог закрыться сам по истечении 30 секунд
             pass
         quiz_state["active_poll_id"] = None
 
-    # 2. Проверяем, есть ли еще вопросы (ИСПРАВЛЕНО)
     if quiz_state["current_index"] >= len(quiz_state["questions"]):
-        await message.answer("🏁 Вопросы закончились! Введи /stats для подведения итогов.")
+        await message.answer("🏁 Вопросы закончились! Введи /stats для итогов.")
         return
 
-    # 3. Достаем текущий вопрос и отправляем опрос (ИСПРАВЛЕНО)
     q = quiz_state["questions"][quiz_state["current_index"]]
 
     sent_msg = await bot.send_poll(
@@ -163,67 +185,51 @@ async def cmd_next(message: Message):
         type="quiz",
         correct_option_id=q["correct_index"],
         is_anonymous=False,
-        open_period=15  # Таймер: опрос закроется через 30 секунд
+        open_period=15
     )
 
-    # 4. Обновляем состояние
     quiz_state["active_poll_id"] = sent_msg.poll.id
     quiz_state["active_chat_id"] = sent_msg.chat.id
     quiz_state["active_message_id"] = sent_msg.message_id
-    quiz_state["first_blood_taken"] = False  # Сбрасываем флаг первого ответившего
-
-    # Сдвигаем индекс для следующего раза
+    quiz_state["first_blood_taken"] = False
     quiz_state["current_index"] += 1
 
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+    if not await is_admin(message): return
 
     if not quiz_state["scores"]:
         text = "🤷‍♂️ Пока никто не заработал баллов."
     else:
-        # Сортируем игроков по убыванию баллов
         sorted_scores = sorted(quiz_state["scores"].values(), key=lambda x: x["score"], reverse=True)
-
-        text = "🏆 **Таблица лидеров:**\n\n"
+        text = "🏆 <b>Таблица лидеров:</b>\n\n"
         for i, user_data in enumerate(sorted_scores, 1):
             text += f"{i}. {user_data['name']} — {user_data['score']} баллов\n"
 
-    # Отправляем результат в личку админу
     try:
-        await bot.send_message(ADMIN_ID, text, parse_mode="Markdown")
+        await bot.send_message(message.from_user.id, text, parse_mode="HTML")
+        if message.chat.id != message.from_user.id:
+            await message.answer("📩 Таблица лидеров отправлена в личные сообщения.")
     except TelegramBadRequest:
-        await message.answer("⚠️ Не могу отправить таблицу! Сначала напиши боту в личных сообщениях.")
-        return
-
-    # Если команда была вызвана не в личке, даём знать в чате, что результат отправлен
-    if message.chat.id != ADMIN_ID:
-        await message.answer("📩 Таблица лидеров отправлена ведущему в личные сообщения.")
+        await message.answer("⚠️ Не могу отправить таблицу в ЛС! Напиши боту сначала.")
 
 
-# Хэндлер, который ловит КАЖДЫЙ ответ юзера в опросе
 @dp.poll_answer()
 async def handle_poll_answer(poll_answer: PollAnswer):
-    # Убеждаемся, что ответ прилетел именно в текущий активный опрос
     if poll_answer.poll_id != quiz_state["active_poll_id"]:
         return
 
-    # Находим правильный ответ для текущего вопроса (ИСПРАВЛЕНО)
     current_q = quiz_state["questions"][quiz_state["current_index"] - 1]
-    chosen_option = poll_answer.option_ids[0]  # В викторине всегда только 1 вариант
+    chosen_option = poll_answer.option_ids[0]
 
-    # Если ответ правильный
     if chosen_option == current_q["correct_index"]:
         user_id = poll_answer.user.id
         user_name = poll_answer.user.first_name
 
-        # Регистрируем юзера в таблице, если его там еще нет
         if user_id not in quiz_state["scores"]:
             quiz_state["scores"][user_id] = {"name": user_name, "score": 0}
 
-        # Начисляем баллы
         if not quiz_state["first_blood_taken"]:
             quiz_state["scores"][user_id]["score"] += 2
             quiz_state["first_blood_taken"] = True
@@ -231,10 +237,23 @@ async def handle_poll_answer(poll_answer: PollAnswer):
             quiz_state["scores"][user_id]["score"] += 1
 
 
-async def main():
-    print("Бот запущен!")
-    await dp.start_polling(bot)
+# --- ВЕБ-СЕРВЕР ДЛЯ RENDER ---
+async def handle_ping(request):
+    return web.Response(text="Quiz Bot is alive!")
 
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+async def main():
+    print("Бот викторины запущен!")
+    await start_web_server()
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
