@@ -7,6 +7,7 @@ import random
 import sys
 import time
 
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandObject
@@ -47,7 +48,31 @@ dp = Dispatcher()
 next_lock = asyncio.Lock()
 background_tasks = set()
 automod_task = None
+PORT = int(os.environ.get("PORT", 10000))
 
+
+async def health_check(request):
+    return web.Response(text="OK")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(
+        runner,
+        host="0.0.0.0",
+        port=PORT,
+    )
+
+    await site.start()
+    log.info("HTTP-сервер запущен на порту %s", PORT)
+
+    return runner
 
 def default_settings() -> dict:
     return {"automod": False, "pause": 7, "shuffle": False}
@@ -655,10 +680,14 @@ async def handle_poll_answer(poll_answer: PollAnswer):
 async def main():
     os.makedirs(PACKS_DIR, exist_ok=True)
     load_state()
+
     if automod_on() and quiz_state["automod_chat_id"]:
         ensure_automod_task()
 
+    web_runner = await start_web_server()
+
     print("Бот запущен!")
+
     try:
         await dp.start_polling(bot)
     finally:
@@ -668,6 +697,8 @@ async def main():
                 await automod_task
             except asyncio.CancelledError:
                 pass
+
+        await web_runner.cleanup()
         await bot.session.close()
 
 
