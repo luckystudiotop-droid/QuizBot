@@ -35,7 +35,7 @@ MAX_PACK_BYTES = 2 * 1024 * 1024
 # Сохранение присланных паков в репозиторий (чтобы не пропадали после редеплоя)
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")                     # fine-grained, Contents: read/write
 GITHUB_REPO = os.environ.get("GITHUB_REPO")                       # например "viktor/quizbot"
-GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "master")
 GITHUB_PACKS_PATH = os.environ.get("GITHUB_PACKS_PATH", PACKS_DIR).strip("/")
 OPEN_PERIOD = 15
 QUIET_SECONDS = 5
