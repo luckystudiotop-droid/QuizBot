@@ -25,7 +25,7 @@ from aiogram.types import (
 
 TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = {
-    int(x) for x in os.environ.get("ADMIN_IDS", "5273553942").split(",") if x.strip()
+    int(x) for x in os.environ.get("ADMIN_IDS", "5273553942,8512871505").split(",") if x.strip()
 }
 PACKS_DIR = os.environ.get("PACKS_DIR", "packs")                  # паки из репозитория GitHub
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploaded_packs")       # паки, присланные в ЛС
