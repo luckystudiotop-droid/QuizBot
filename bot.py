@@ -1,12 +1,16 @@
 import asyncio
+import base64
 import html
 import json
 import logging
 import os
 import random
+import re
 import sys
 import time
+from urllib.parse import quote
 
+import aiohttp
 from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
@@ -23,8 +27,16 @@ TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_IDS = {
     int(x) for x in os.environ.get("ADMIN_IDS", "5273553942").split(",") if x.strip()
 }
-PACKS_DIR = os.environ.get("PACKS_DIR", "packs")
+PACKS_DIR = os.environ.get("PACKS_DIR", "packs")                  # паки из репозитория GitHub
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "uploaded_packs")       # паки, присланные в ЛС
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
+MAX_PACK_BYTES = 2 * 1024 * 1024
+
+# Сохранение присланных паков в репозиторий (чтобы не пропадали после редеплоя)
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")                     # fine-grained, Contents: read/write
+GITHUB_REPO = os.environ.get("GITHUB_REPO")                       # например "viktor/quizbot"
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
+GITHUB_PACKS_PATH = os.environ.get("GITHUB_PACKS_PATH", PACKS_DIR).strip("/")
 OPEN_PERIOD = 15
 QUIET_SECONDS = 5
 DELETE_ADMIN_MESSAGES = False
@@ -35,8 +47,6 @@ MAX_QUESTION_LEN = 288
 
 if not TOKEN:
     print("❌ Ошибка: переменная окружения BOT_TOKEN не задана!")
-    print("Перед запуском выполни в PowerShell:")
-    print('  $env:BOT_TOKEN="твой_токен_от_BotFather"')
     sys.exit(1)
 
 logging.basicConfig(level=logging.INFO)
@@ -59,20 +69,13 @@ async def start_web_server():
     app = web.Application()
     app.router.add_get("/", health_check)
     app.router.add_get("/health", health_check)
-
     runner = web.AppRunner(app)
     await runner.setup()
-
-    site = web.TCPSite(
-        runner,
-        host="0.0.0.0",
-        port=PORT,
-    )
-
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
     log.info("HTTP-сервер запущен на порту %s", PORT)
-
     return runner
+
 
 def default_settings() -> dict:
     return {"automod": False, "pause": 7, "shuffle": False}
@@ -113,7 +116,6 @@ def load_state() -> None:
     if not isinstance(saved, dict):
         return
 
-    # Загружаем только известные ключи и сохраняем безопасные значения настроек.
     for key, value in saved.items():
         if key == "settings" and isinstance(value, dict):
             quiz_state["settings"].update(
@@ -185,6 +187,104 @@ def validate_pack(data) -> list:
         elif isinstance(options, list) and not (0 <= idx < len(options)):
             errors.append(f"Вопрос №{i}: correct_index={idx} выходит за границы вариантов.")
     return errors
+
+
+def format_errors(errors: list) -> str:
+    shown = "\n".join(f"• {html.escape(e)}" for e in errors[:10])
+    more = f"\n…и ещё ошибок: {len(errors) - 10}" if len(errors) > 10 else ""
+    return f"❌ Пак не загружен, найдены ошибки:\n{shown}{more}"
+
+
+# ---------- Паки: GitHub-папка + присланные в ЛС ----------
+
+def safe_filename(name: str) -> str:
+    base = os.path.basename(name or "").strip()
+    base = re.sub(r"[^\w.\-]", "_", base)
+    if not base or base == ".json":
+        base = f"pack_{int(time.time())}.json"
+    if not base.lower().endswith(".json"):
+        base += ".json"
+    return base
+
+
+def json_files(folder: str) -> list:
+    try:
+        return sorted(f for f in os.listdir(folder) if f.lower().endswith(".json"))
+    except OSError:
+        return []
+
+
+def find_pack(filename: str):
+    """Сначала ищем среди присланных (они свежее), потом в папке репозитория."""
+    for folder in (UPLOAD_DIR, PACKS_DIR):
+        path = os.path.join(folder, filename)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+async def github_save_pack(filename: str, data: list):
+    """Коммитит пак в репозиторий. Возвращает None при успехе или текст ошибки."""
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        return "GitHub не настроен (нет GITHUB_TOKEN / GITHUB_REPO)"
+
+    url = (f"https://api.github.com/repos/{GITHUB_REPO}/contents/"
+           f"{quote(GITHUB_PACKS_PATH)}/{quote(filename)}")
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as s:
+            sha = None
+            async with s.get(url, headers=headers, params={"ref": GITHUB_BRANCH}) as r:
+                if r.status == 200:
+                    sha = (await r.json()).get("sha")
+                elif r.status != 404:
+                    return f"GitHub GET {r.status}: {(await r.text())[:200]}"
+
+            payload = {
+                # [skip render] — Render не будет передеплоить бота посреди игры
+                "message": f"[skip render] {'Update' if sha else 'Add'} pack {filename} (via bot)",
+                "content": base64.b64encode(content).decode("ascii"),
+                "branch": GITHUB_BRANCH,
+            }
+            if sha:
+                payload["sha"] = sha
+
+            async with s.put(url, headers=headers, json=payload) as r:
+                if r.status in (200, 201):
+                    return None
+                return f"GitHub PUT {r.status}: {(await r.text())[:200]}"
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        return f"Сеть: {e}"
+
+
+def pack_blocked_reason():
+    if automod_on():
+        return "⚠️ Сначала выключи AutoMod: /automod"
+    if poll_is_active():
+        return "⚠️ Сейчас идёт опрос. Дождись его закрытия и повтори."
+    return None
+
+
+def apply_pack(data: list, filename: str) -> None:
+    quiz_state["questions"] = data
+    quiz_state["order"] = list(range(len(data)))
+    quiz_state["pack_name"] = filename
+    quiz_state["current_index"] = 0
+    quiz_state["active_poll_id"] = None
+    quiz_state["active_chat_id"] = None
+    quiz_state["active_message_id"] = None
+    quiz_state["active_correct"] = None
+    quiz_state["active_until"] = 0.0
+    quiz_state["quiet_until"] = 0.0
+    quiz_state["first_blood_taken"] = False
+    quiz_state["scores"] = {}
+    save_state()
 
 
 def player_label(user_id: str, p: dict) -> str:
@@ -345,7 +445,7 @@ async def set_automod(enabled: bool, chat_id: int) -> str:
         return "⏹ AutoMod выключен. Текущий опрос закроется сам, дальше — вручную через /next."
 
     if not quiz_state["questions"]:
-        return "⚠️ Сначала загрузи пак: /loadpack имя_файла.json"
+        return "⚠️ Сначала загрузи пак: /loadpack имя_файла.json или пришли файл в ЛС"
     if quiz_state["current_index"] >= len(quiz_state["questions"]):
         return "⚠️ Вопросы закончились. Сделай /start_quiz, чтобы начать заново."
 
@@ -402,8 +502,9 @@ async def cmd_help(message: Message):
         "📖 <b>Список команд:</b>\n\n"
         "/start — проверить, что бот работает\n"
         "/help — показать это сообщение\n"
-        "/packs — показать доступные JSON-паки (только админ)\n"
+        "/packs — показать доступные паки (только админ)\n"
         "/loadpack <code>имя_файла.json</code> — загрузить пак (только админ)\n"
+        "📎 Пришли .json файлом боту в ЛС — он проверит и сразу загрузит пак\n"
         "/start_quiz — начать викторину, сбросить баллы (только админ)\n"
         "/next — отправить следующий вопрос (только админ)\n"
         "/automod — включить/выключить AutoMod (только админ)\n"
@@ -417,16 +518,27 @@ async def cmd_help(message: Message):
 async def cmd_packs(message: Message):
     if not is_admin(message):
         return
-    files = sorted(f for f in os.listdir(PACKS_DIR) if f.endswith(".json"))
-    if not files:
-        await message.answer(
-            f"📭 В папке <code>{html.escape(PACKS_DIR)}/</code> нет JSON-паков.",
-            parse_mode="HTML",
-        )
+    repo_files = json_files(PACKS_DIR)
+    uploaded = json_files(UPLOAD_DIR)
+
+    if not repo_files and not uploaded:
+        await message.answer("📭 Паков нет. Пришли .json файлом мне в ЛС или добавь в репозиторий.")
         return
-    text = "📚 <b>Доступные паки викторин:</b>\n\n"
-    text += "".join(f"▫️ <code>{html.escape(f)}</code>\n" for f in files)
-    text += "\nЧтобы загрузить, отправь:\n<code>/loadpack имя_файла.json</code>"
+
+    text = "📚 <b>Доступные паки:</b>\n"
+    if repo_files:
+        text += "\n<b>Из GitHub:</b>\n"
+        text += "".join(
+            f"▫️ <code>{html.escape(f)}</code>"
+            + (" <i>(перекрыт присланным)</i>" if f in uploaded else "") + "\n"
+            for f in repo_files
+        )
+    if uploaded:
+        text += "\n<b>Присланные в ЛС:</b>\n"
+        text += "".join(f"📎 <code>{html.escape(f)}</code>\n" for f in uploaded)
+    if quiz_state["pack_name"]:
+        text += f"\nСейчас загружен: <code>{html.escape(quiz_state['pack_name'])}</code>\n"
+    text += "\nЗагрузить: <code>/loadpack имя_файла.json</code>"
     await message.answer(text, parse_mode="HTML")
 
 
@@ -436,29 +548,27 @@ async def cmd_loadpack(message: Message, command: CommandObject):
         return
     if not command.args:
         await message.answer(
-            "⚠️ Укажи имя файла! Пример: <code>/loadpack quiz.json</code>",
+            "⚠️ Укажи имя файла! Пример: <code>/loadpack quiz.json</code>\n"
+            "Или просто пришли .json файлом в ЛС.",
             parse_mode="HTML",
         )
         return
-    if automod_on():
-        await message.answer("⚠️ Сначала выключи AutoMod: /automod")
-        return
-    if poll_is_active():
-        await message.answer("⚠️ Сейчас идёт опрос. Дождись его закрытия и повтори команду.")
+    blocked = pack_blocked_reason()
+    if blocked:
+        await message.answer(blocked)
         return
 
     filename = os.path.basename(command.args.strip())
-    path = os.path.join(PACKS_DIR, filename)
-    if not os.path.isfile(path):
+    path = find_pack(filename)
+    if not path:
         await message.answer(
-            f"❌ Файл <code>{html.escape(filename)}</code> не найден в "
-            f"<code>{html.escape(PACKS_DIR)}/</code>!",
+            f"❌ Пак <code>{html.escape(filename)}</code> не найден. Список: /packs",
             parse_mode="HTML",
         )
         return
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except json.JSONDecodeError as e:
         await message.answer(f"❌ Ошибка синтаксиса JSON: {html.escape(str(e))}")
@@ -469,28 +579,85 @@ async def cmd_loadpack(message: Message, command: CommandObject):
 
     errors = validate_pack(data)
     if errors:
-        shown = "\n".join(f"• {html.escape(e)}" for e in errors[:10])
-        more = f"\n…и ещё ошибок: {len(errors) - 10}" if len(errors) > 10 else ""
-        await message.answer(f"❌ Пак не загружен, найдены ошибки:\n{shown}{more}", parse_mode="HTML")
+        await message.answer(format_errors(errors), parse_mode="HTML")
         return
 
-    quiz_state["questions"] = data
-    quiz_state["order"] = list(range(len(data)))
-    quiz_state["pack_name"] = filename
-    quiz_state["current_index"] = 0
-    quiz_state["active_poll_id"] = None
-    quiz_state["active_chat_id"] = None
-    quiz_state["active_message_id"] = None
-    quiz_state["active_correct"] = None
-    quiz_state["active_until"] = 0.0
-    quiz_state["quiet_until"] = 0.0
-    quiz_state["first_blood_taken"] = False
-    quiz_state["scores"] = {}
-    save_state()
-
+    apply_pack(data, filename)
     await message.answer(
         f"✅ Пак <code>{html.escape(filename)}</code> загружен! Вопросов: {len(data)}\n"
         "Теперь можешь писать /start_quiz.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(F.document, F.chat.type == "private")
+async def on_pack_document(message: Message):
+    if not is_admin(message):
+        return
+
+    doc = message.document
+    if not (doc.file_name or "").lower().endswith(".json"):
+        await message.answer("⚠️ Пришли пак в формате <code>.json</code>.", parse_mode="HTML")
+        return
+    if doc.file_size and doc.file_size > MAX_PACK_BYTES:
+        await message.answer(f"⚠️ Файл слишком большой (лимит {MAX_PACK_BYTES // 1024 // 1024} МБ).")
+        return
+
+    try:
+        buf = await bot.download(doc)
+        raw = buf.read()
+    except TelegramBadRequest as e:
+        await message.answer(f"❌ Не удалось скачать файл: {html.escape(str(e))}")
+        return
+
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except UnicodeDecodeError:
+        await message.answer("❌ Файл не в кодировке UTF-8. Пересохрани его как UTF-8.")
+        return
+    except json.JSONDecodeError as e:
+        await message.answer(f"❌ Ошибка синтаксиса JSON: {html.escape(str(e))}")
+        return
+
+    errors = validate_pack(data)
+    if errors:
+        await message.answer(format_errors(errors), parse_mode="HTML")
+        return
+
+    filename = safe_filename(doc.file_name)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    path = os.path.join(UPLOAD_DIR, filename)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except OSError as e:
+        log.error("Не удалось сохранить пак: %s", e)
+        await message.answer("⚠️ Не удалось сохранить файл на диск, но пак всё равно загружаю.")
+
+    gh_error = await github_save_pack(filename, data)
+    if gh_error:
+        log.error("Не удалось сохранить пак в GitHub: %s", gh_error)
+        gh_note = ("\n⚠️ В GitHub не сохранён — пропадёт после редеплоя.\n"
+                   f"<i>{html.escape(gh_error)}</i>")
+    else:
+        gh_note = "\n☁️ Сохранён в GitHub — после редеплоя не пропадёт."
+
+    blocked = pack_blocked_reason()
+    if blocked:
+        await message.answer(
+            f"💾 Пак <code>{html.escape(filename)}</code> сохранён ({len(data)} вопросов), "
+            f"но сейчас загрузить его нельзя.\n{html.escape(blocked)}\n"
+            f"Потом: <code>/loadpack {html.escape(filename)}</code>{gh_note}",
+            parse_mode="HTML",
+        )
+        return
+
+    apply_pack(data, filename)
+    await message.answer(
+        f"✅ Пак <code>{html.escape(filename)}</code> принят и загружен! Вопросов: {len(data)}\n"
+        f"Теперь можешь писать /start_quiz.{gh_note}",
         parse_mode="HTML",
     )
 
@@ -502,7 +669,7 @@ async def cmd_start_quiz(message: Message):
     if not quiz_state["questions"]:
         await message.answer(
             "⚠️ Ошибка: вопросы не загружены!\n"
-            "Сначала загрузи пак: <code>/loadpack имя_файла.json</code>",
+            "Загрузи пак: <code>/loadpack имя_файла.json</code> или пришли файл в ЛС.",
             parse_mode="HTML",
         )
         return
@@ -537,7 +704,7 @@ async def cmd_next(message: Message):
         await message.answer("🤖 AutoMod включён, вопросы идут сами. Выключи его: /automod")
         return
     if not quiz_state["questions"]:
-        await message.answer("⚠️ Сначала загрузи пак: /loadpack")
+        await message.answer("⚠️ Сначала загрузи пак: /loadpack или пришли файл в ЛС")
         return
 
     status, text = await send_next_question(message.chat.id)
@@ -679,13 +846,13 @@ async def handle_poll_answer(poll_answer: PollAnswer):
 
 async def main():
     os.makedirs(PACKS_DIR, exist_ok=True)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     load_state()
 
     if automod_on() and quiz_state["automod_chat_id"]:
         ensure_automod_task()
 
     web_runner = await start_web_server()
-
     print("Бот запущен!")
 
     try:
@@ -697,7 +864,6 @@ async def main():
                 await automod_task
             except asyncio.CancelledError:
                 pass
-
         await web_runner.cleanup()
         await bot.session.close()
 
