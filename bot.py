@@ -45,6 +45,13 @@ MAX_LEADERBOARD_ROWS = 50
 PAUSE_MIN, PAUSE_MAX = 3, 60
 MAX_QUESTION_LEN = 288
 
+# Баллы
+FIRST_POINTS = 2          # первый правильный ответ
+OTHER_POINTS = 1          # остальные правильные
+SOLO_POINTS = 3           # единственный правильный ответ на вопрос
+SOLO_REQUIRES_WRONG = True  # +3 только если кто-то ещё ответил (и ошибся)
+SOLO_ANNOUNCE = True      # писать в чат, кто забрал +3
+
 if not TOKEN:
     print("❌ Ошибка: переменная окружения BOT_TOKEN не задана!")
     sys.exit(1)
@@ -87,6 +94,7 @@ def default_state() -> dict:
         "active_poll_id": None, "active_chat_id": None, "active_message_id": None,
         "active_correct": None, "active_until": 0.0, "quiet_until": 0.0,
         "first_blood_taken": False, "automod_chat_id": None,
+        "active_correct_users": [], "active_wrong_count": 0, "active_finalized": False,
         "settings": default_settings(), "scores": {},
     }
 
@@ -283,6 +291,9 @@ def apply_pack(data: list, filename: str) -> None:
     quiz_state["active_until"] = 0.0
     quiz_state["quiet_until"] = 0.0
     quiz_state["first_blood_taken"] = False
+    quiz_state["active_correct_users"] = []
+    quiz_state["active_wrong_count"] = 0
+    quiz_state["active_finalized"] = False
     quiz_state["scores"] = {}
     save_state()
 
@@ -311,7 +322,41 @@ def build_leaderboard(title: str = "🏆 <b>Таблица лидеров:</b>")
     return "\n".join(lines)
 
 
+async def finalize_active_poll() -> None:
+    """Подводит итог вопроса: если правильный ответ один — доначисляет до SOLO_POINTS."""
+    if not quiz_state["active_poll_id"] or quiz_state.get("active_finalized"):
+        return
+    quiz_state["active_finalized"] = True
+
+    correct = quiz_state.get("active_correct_users") or []
+    wrong = quiz_state.get("active_wrong_count", 0)
+    if len(correct) == 1 and (wrong > 0 or not SOLO_REQUIRES_WRONG):
+        uid = correct[0]
+        player = quiz_state["scores"].get(uid)
+        if player:
+            player["score"] += SOLO_POINTS - FIRST_POINTS
+            save_state()
+            if SOLO_ANNOUNCE and quiz_state["active_chat_id"]:
+                try:
+                    await bot.send_message(
+                        quiz_state["active_chat_id"],
+                        f"🎯 Единственный правильный ответ! {player_label(uid, player)} "
+                        f"получает +{SOLO_POINTS}",
+                        parse_mode="HTML",
+                    )
+                except (TelegramBadRequest, TelegramForbiddenError) as e:
+                    log.warning("Не удалось объявить бонус: %s", e)
+    save_state()
+
+
+async def poll_timer(poll_id: str) -> None:
+    await asyncio.sleep(OPEN_PERIOD + 1.5)
+    if quiz_state["active_poll_id"] == poll_id:
+        await finalize_active_poll()
+
+
 async def close_active_poll() -> None:
+    await finalize_active_poll()
     if quiz_state["active_poll_id"]:
         try:
             await bot.stop_poll(
@@ -333,6 +378,7 @@ async def send_final_results(chat_id: int, poll_id: str) -> None:
     await asyncio.sleep(OPEN_PERIOD + 2)
     if quiz_state["active_poll_id"] != poll_id:
         return
+    await finalize_active_poll()
     text = build_leaderboard("🏁 <b>Викторина окончена! Итоги:</b>")
     target = chat_id if FINAL_TO_CHAT else next(iter(ADMIN_IDS))
     try:
@@ -374,8 +420,15 @@ async def send_next_question(chat_id: int):
         quiz_state["active_until"] = time.time() + OPEN_PERIOD
         quiz_state["quiet_until"] = time.time() + QUIET_SECONDS
         quiz_state["first_blood_taken"] = False
+        quiz_state["active_correct_users"] = []
+        quiz_state["active_wrong_count"] = 0
+        quiz_state["active_finalized"] = False
         quiz_state["current_index"] += 1
         save_state()
+
+        timer = asyncio.create_task(poll_timer(sent.poll.id))
+        background_tasks.add(timer)
+        timer.add_done_callback(background_tasks.discard)
 
         if quiz_state["current_index"] >= total:
             task = asyncio.create_task(send_final_results(sent.chat.id, sent.poll.id))
@@ -509,7 +562,9 @@ async def cmd_help(message: Message):
         "/next — отправить следующий вопрос (только админ)\n"
         "/automod — включить/выключить AutoMod (только админ)\n"
         "/settings — меню настроек (только админ)\n"
-        "/stats — таблица лидеров в личку (только админ)"
+        "/stats — таблица лидеров в личку (только админ)\n\n"
+        f"🎯 <b>Баллы:</b> первый правильный +{FIRST_POINTS}, остальные +{OTHER_POINTS}, "
+        f"единственный правильный +{SOLO_POINTS}"
     )
     await message.answer(text, parse_mode="HTML")
 
@@ -823,13 +878,22 @@ async def on_settings_button(cb: CallbackQuery):
 async def handle_poll_answer(poll_answer: PollAnswer):
     if poll_answer.poll_id != quiz_state["active_poll_id"]:
         return
+    if quiz_state.get("active_finalized"):
+        return
     if not poll_answer.option_ids:
         return
     if poll_answer.option_ids[0] != quiz_state["active_correct"]:
+        quiz_state["active_wrong_count"] = quiz_state.get("active_wrong_count", 0) + 1
+        save_state()
         return
 
     user = poll_answer.user
     uid = str(user.id)
+    correct_users = quiz_state.setdefault("active_correct_users", [])
+    if uid in correct_users:
+        return
+    correct_users.append(uid)
+
     player = quiz_state["scores"].setdefault(
         uid, {"name": user.first_name, "username": None, "score": 0}
     )
@@ -837,10 +901,10 @@ async def handle_poll_answer(poll_answer: PollAnswer):
     player["username"] = user.username
 
     if not quiz_state["first_blood_taken"]:
-        player["score"] += 2
+        player["score"] += FIRST_POINTS
         quiz_state["first_blood_taken"] = True
     else:
-        player["score"] += 1
+        player["score"] += OTHER_POINTS
     save_state()
 
 
